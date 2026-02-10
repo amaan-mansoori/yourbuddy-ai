@@ -5,3 +5,4 @@ groq
 numpy
 sentence-transformers
 pypdf
+python-multipart
