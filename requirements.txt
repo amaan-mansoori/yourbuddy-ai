@@ -4,3 +4,4 @@ python-dotenv
 groq
 numpy
 sentence-transformers
+pypdf
