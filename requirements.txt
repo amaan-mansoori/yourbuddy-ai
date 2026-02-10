@@ -3,3 +3,4 @@ uvicorn
 python-dotenv
 groq
 numpy
+sentence-transformers
