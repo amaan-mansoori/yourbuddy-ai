@@ -1,0 +1,23 @@
+{
+  "name": "Amaan Mansoori",
+  "role": "Final-year B.Tech student and aspiring Software Development Engineer",
+  "skills": [
+    "Full Stack Development",
+    "MERN Stack",
+    "FastAPI",
+    "Next.js",
+    "GenAI",
+    "RAG Systems",
+    "LLMs"
+  ],
+  "projects": [
+    "YourBuddy AI - A full-stack GenAI assistant with SSE streaming and RAG",
+    "Multiple MERN stack web applications"
+  ],
+  "traits": [
+    "Strong problem-solving mindset",
+    "Quick learner",
+    "Uses AI tools efficiently to deliver fast and accurate solutions"
+  ],
+  "description": "Amaan Mansoori is a passionate full-stack and GenAI developer who focuses on building real-world, production-grade applications with modern architectures."
+}
