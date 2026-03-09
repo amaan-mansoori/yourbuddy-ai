@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -6,10 +6,11 @@ from pydantic import BaseModel
 from typing import Dict, Optional
 from uuid import uuid4
 from dotenv import load_dotenv
-import os, json
+import os, json, time
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import groq
 from groq import Groq
 from pypdf import PdfReader
 
@@ -32,15 +33,31 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
 
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
 
 # MEMORY (USER ONLY)
 
 chat_store: Dict[str, dict] = {}
 MAX_MEMORY_TURNS = 8
+CHAT_EXPIRY_SECONDS = 3600  # 1 hour
+
 
 def trim_memory(memory):
     if len(memory) > MAX_MEMORY_TURNS:
-        del memory[:-MAX_MEMORY_TURNS]
+        memory[:] = memory[-MAX_MEMORY_TURNS:]
+
+
+def cleanup_old_chats():
+    """Remove chat sessions that have been idle for longer than CHAT_EXPIRY_SECONDS."""
+    now = time.time()
+    expired = [
+        cid for cid, data in list(chat_store.items())
+        if now - data.get("last_active", now) > CHAT_EXPIRY_SECONDS
+    ]
+    for cid in expired:
+        del chat_store[cid]
 
 
 # EMBEDDINGS
@@ -55,8 +72,10 @@ def embedder():
 def embed(text):
     return embedder().encode(text, normalize_embeddings=True)
 
-def cosine(a, b):
-    return float(np.dot(a, b)) if a.shape == b.shape else -1.0
+
+def embed_batch(texts):
+    """Encode a list of texts in a single batched forward pass."""
+    return embedder().encode(texts, normalize_embeddings=True, batch_size=64)
 
 
 # MODELS
@@ -155,9 +174,18 @@ RAG_SYSTEM = {
 
 # HELPERS
 
-def chunk_text(text, size=250):
+def chunk_text(text, size=250, overlap=50):
+    """Split text into overlapping word-based chunks for better context retrieval."""
+    if overlap >= size:
+        raise ValueError(f"overlap ({overlap}) must be less than size ({size})")
     words = text.split()
-    return [" ".join(words[i:i+size]) for i in range(0, len(words), size)]
+    step = size - overlap
+    chunks = []
+    for i in range(0, len(words), step):
+        chunk = words[i:i + size]
+        if chunk:
+            chunks.append(" ".join(chunk))
+    return chunks
 
 def is_doc_question(msg):
     return any(k in msg.lower() for k in ["pdf", "document", "uploaded"])
@@ -167,6 +195,13 @@ def is_doc_question(msg):
 
 @app.post("/rag/upload")
 async def upload_pdf(chat_id: str, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+
+    content = await file.read(MAX_FILE_SIZE + 1)
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 10 MB.")
+
     path = os.path.join(UPLOAD_DIR, chat_id)
     os.makedirs(path, exist_ok=True)
 
@@ -174,20 +209,24 @@ async def upload_pdf(chat_id: str, file: UploadFile = File(...)):
     full_path = os.path.join(path, fname)
 
     with open(full_path, "wb") as f:
-        f.write(await file.read())
+        f.write(content)
 
     reader = PdfReader(full_path)
     text = "\n".join(p.extract_text() or "" for p in reader.pages)
 
-    vectors = [{"text": c, "vec": embed(c)} for c in chunk_text(text)]
+    # Batch-encode all chunks in a single model pass for efficiency
+    chunks = chunk_text(text)
+    chunk_vecs = embed_batch(chunks)
+    vectors = [{"text": c, "vec": v} for c, v in zip(chunks, chunk_vecs)]
 
-    chat_store.setdefault(chat_id, {"users": [], "docs": []})
-    chat_store[chat_id]["docs"].append(vectors)
+    chat = chat_store.setdefault(chat_id, {"users": [], "docs": [], "last_active": time.time()})
+    chat["docs"].append(vectors)
+    chat["last_active"] = time.time()
 
     return {
         "file": {
             "name": file.filename,
-            "url": f"http://localhost:8000/files/{chat_id}/{fname}"
+            "url": f"{BASE_URL}/files/{chat_id}/{fname}"
         }
     }
 
@@ -196,18 +235,25 @@ async def upload_pdf(chat_id: str, file: UploadFile = File(...)):
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
+    cleanup_old_chats()
+
     chat_id = req.chat_id or str(uuid4())
-    chat = chat_store.setdefault(chat_id, {"users": [], "docs": []})
+    chat = chat_store.setdefault(chat_id, {"users": [], "docs": [], "last_active": time.time()})
+    chat["last_active"] = time.time()
 
     use_rag = chat["docs"] and is_doc_question(req.message)
 
     if use_rag:
         q = embed(req.message)
-        scored = []
-        for d in chat["docs"]:
-            for c in d:
-                scored.append((c["text"], cosine(q, c["vec"])))
-        context = "\n\n".join(t[0] for t in sorted(scored, key=lambda x: x[1], reverse=True)[:2])
+        # Flatten all chunks and run vectorized similarity in one matrix multiply
+        all_chunks = [c for d in chat["docs"] for c in d]
+        if all_chunks:
+            vecs = np.stack([c["vec"] for c in all_chunks])
+            scores = vecs @ q  # dot products for all vectors at once (L2-normalised)
+            top_indices = np.argsort(scores)[::-1][:2]
+            context = "\n\n".join(all_chunks[i]["text"] for i in top_indices)
+        else:
+            context = ""
 
         messages = [
             RAG_SYSTEM,
@@ -220,14 +266,19 @@ async def chat_stream(req: ChatRequest, request: Request):
             messages.append({"role": "user", "content": u})
         messages.append({"role": "user", "content": req.message})
 
-    completion = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=messages,
-        temperature=0.2,
-        max_tokens=700,
-    )
-
-    final = completion.choices[0].message.content.strip()
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.2,
+            max_tokens=700,
+        )
+        final = completion.choices[0].message.content.strip()
+    except groq.APIError:
+        async def err_stream():
+            yield f"data: {json.dumps({'token': 'Sorry, I encountered an error. Please try again.'})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        return StreamingResponse(err_stream(), media_type="text/event-stream")
 
     async def stream():
         yield f"data: {json.dumps({'token': final})}\n\n"
